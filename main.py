@@ -14,6 +14,7 @@ def run_pipeline():
     from agents.trend_agent import TrendAgent
     from agents.content_agent import ContentAgent
     from agents.image_agent import ImageAgent
+    from agents.music_agent import MusicAgent
     from agents.video_agent import VideoAgent
     from agents.verifier_agent import VerifierAgent
     from agents.publisher_agent import PublisherAgent
@@ -76,9 +77,20 @@ def run_pipeline():
 
     console.print(f"[green]✓ {image_result.data['images_generated']}/{image_result.data['total']} images generated[/green]")
 
-    console.print("\n[bold yellow]── AGENT 4: VIDEO CREATION ──[/bold yellow]")
+    console.print("\n[bold yellow]── AGENT 4: MUSIC SELECTION ──[/bold yellow]")
+    music_agent  = MusicAgent(niche=NICHE)
+    music_result = music_agent.run({"posts": image_result.data["posts"], "niche": NICHE})
+
+    if not music_result.success:
+        console.print(f"[yellow]MusicAgent warning: {music_result.errors} — continuing without music[/yellow]")
+        music_posts = image_result.data["posts"]
+    else:
+        console.print(f"[green]✓ {music_result.data['music_added']}/{music_result.data['total']} tracks fetched[/green]")
+        music_posts = music_result.data["posts"]
+
+    console.print("\n[bold yellow]── AGENT 5: VIDEO CREATION ──[/bold yellow]")
     video_agent  = VideoAgent(duration=30, niche=NICHE)
-    video_result = video_agent.run({"posts": image_result.data["posts"], "niche": NICHE})
+    video_result = video_agent.run({"posts": music_posts, "niche": NICHE})
 
     if not video_result.success:
         console.print(f"[red]VideoAgent failed: {video_result.errors}[/red]")
@@ -86,7 +98,7 @@ def run_pipeline():
 
     console.print(f"[green]✓ {video_result.data['videos_created']}/{video_result.data['total']} videos created[/green]")
 
-    console.print("\n[bold yellow]── AGENT 5: VERIFICATION + APPROVAL ──[/bold yellow]")
+    console.print("\n[bold yellow]── AGENT 6: VERIFICATION + APPROVAL ──[/bold yellow]")
     verifier_agent = VerifierAgent(niche=NICHE)
     verify_result = verifier_agent.run({
         "posts": video_result.data["posts"],
@@ -98,7 +110,7 @@ def run_pipeline():
 
     console.print(f"\n[bold green]✓ {verify_result.data['total']} post(s) approved and ready to publish.[/bold green]")
 
-    console.print("\n[bold yellow]── AGENT 5: INSTAGRAM PUBLISHER ──[/bold yellow]")
+    console.print("\n[bold yellow]── AGENT 7: INSTAGRAM PUBLISHER ──[/bold yellow]")
     console.print("[dim]Running in DRY RUN mode — set dry_run=False to post live[/dim]\n")
 
     publisher = PublisherAgent(dry_run=True)

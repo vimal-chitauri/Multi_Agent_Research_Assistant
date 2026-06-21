@@ -6,8 +6,6 @@ from dotenv import load_dotenv
 from agents.base_agent import BaseAgent, AgentResult
 from tools.video_tools import (
     NICHE_VIDEO_PROMPTS,
-    search_freesound_music,
-    download_music,
     create_video,
     create_news_video,
     group_bullet_points,
@@ -79,10 +77,9 @@ class VideoAgent(BaseAgent):
 
     def __init__(self, duration: int = 30, niche: str = "technology"):
         super().__init__(name="VideoAgent", model="smart")
-        self.duration   = duration
-        self.niche      = niche
-        self.hf_token   = os.getenv("HUGGINGFACE_TOKEN")
-        self.freesound  = os.getenv("FREESOUND_API_KEY")
+        self.duration = duration
+        self.niche    = niche
+        self.hf_token = os.getenv("HUGGINGFACE_TOKEN")
 
     @property
     def system_prompt(self) -> str:
@@ -97,17 +94,13 @@ class VideoAgent(BaseAgent):
 
         if not self.hf_token:
             self._log("[yellow]HUGGINGFACE_TOKEN not set — AI video disabled, using Ken Burns[/yellow]")
-        if not self.freesound:
-            self._log("[yellow]FREESOUND_API_KEY not set — videos will be silent[/yellow]")
 
         self._log(
             f"Creating [bold]{self.duration}s[/bold] videos | niche: [cyan]{niche}[/cyan] | "
             f"AI video: [cyan]{'on' if self.hf_token else 'off (Ken Burns fallback)'}[/cyan]"
         )
 
-        videos_created    = 0
-        _fallback_music   = None
-        _fallback_title   = "No music"
+        videos_created = 0
 
         for post in posts:
             topic      = post["topic"]
@@ -115,27 +108,13 @@ class VideoAgent(BaseAgent):
             rank       = post.get("rank", 0)
             timestamp  = int(time.time())
 
-            self._log(f"Processing: [cyan]{topic}[/cyan]")
+            music_path  = post.get("music_path")
+            music_title = post.get("music_title", "No music")
 
-            music_path  = None
-            music_title = "No music"
-            if self.freesound:
-                track = search_freesound_music(niche, rank=rank)
-                if track:
-                    music_title = f"{track.get('name', '?')} — {track.get('username', '?')}"
-                    self._log(f"  Music: {music_title}")
-                    music_path = download_music(track, f"music_{niche}_{rank}_{timestamp}.mp3")
-
-                if not music_path and _fallback_music:
-                    music_path  = _fallback_music
-                    music_title = _fallback_title
-                    self._log(f"  Music: reusing cached track (Freesound rate-limit)")
-                elif not music_path:
-                    self._log("  [yellow]No Freesound track found[/yellow]")
-
-                if music_path:
-                    _fallback_music = music_path
-                    _fallback_title = music_title
+            self._log(
+                f"Processing: [cyan]{topic}[/cyan]  |  "
+                f"music: [dim]{'✓ ' + music_title[:40] if music_path else 'none'}[/dim]"
+            )
 
             video_path = str(VIDEOS_DIR / f"post_{rank}_{timestamp}.mp4")
 

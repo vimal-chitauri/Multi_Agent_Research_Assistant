@@ -210,6 +210,23 @@ def _run_pipeline(niche: str, dry_run: bool, pub_ig: bool, pub_fb: bool, manual_
             _alog("🎙️ Voice narration disabled — skipping")
 
         with _ps_lock: _ps["step"] = 4; _ps["agent_logs"][4] = []
+        _sub("Fetching background music tracks…", 5)
+        _alog("🎵 Music Selection Agent — initializing")
+        _alog(f"  source=Freesound  strategy=topic-keywords → mood → niche  posts={len(r3.data['posts'])}")
+        try:
+            from agents.music_agent import MusicAgent
+            _tm0  = time.time()
+            r_m   = MusicAgent(niche=niche).run({"posts": r3.data["posts"], "niche": niche})
+            _alog(f"  ← MusicAgent  {int((time.time()-_tm0)*1000)}ms  "
+                  f"tracks={r_m.data.get('music_added',0)}/{len(r3.data['posts'])}")
+            if r_m.success:
+                r3.data["posts"] = r_m.data["posts"]
+                for p in r3.data["posts"]:
+                    _alog(f"  post#{p.get('rank','?')}  track={p.get('music_title','none')[:50]}")
+            _sub(f"✅ {r_m.data.get('music_added',0)} track(s) ready", 100)
+        except Exception as me:
+            _alog(f"  ⚠️ MusicAgent error (skipping): {me}")
+
         posts4 = r3.data["posts"]
         n4     = len(posts4)
         _sub(f"Compositing {n4} × 30s MP4 videos…", 5)
