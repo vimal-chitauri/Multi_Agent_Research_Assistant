@@ -1,8 +1,10 @@
+import hashlib
 import os
 import re
 import time
 import requests
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from dotenv import load_dotenv
 from agents.base_agent import BaseAgent, AgentResult
@@ -12,6 +14,9 @@ load_dotenv(override=True)
 
 IMAGES_DIR = Path(__file__).parent.parent / "generated_images"
 IMAGES_DIR.mkdir(exist_ok=True)
+
+IMAGE_W = 1080
+IMAGE_H = 1920
 
 HF_MODELS = [
     "black-forest-labs/FLUX.1-schnell",
@@ -40,7 +45,7 @@ class ImageAgent(BaseAgent):
 
     @property
     def system_prompt(self) -> str:
-        return "You are an image prompt optimizer for social media posts."
+        return "You are an image prompt engineer for Instagram Reels short-form video content."
 
     def run(self, input_data: dict) -> AgentResult:
         posts = input_data.get("posts", [])
@@ -51,12 +56,13 @@ class ImageAgent(BaseAgent):
             self._log(
                 f"Image chain: [bold]{len(HF_MODELS)} HF[/bold] → "
                 f"[bold]{len(POLLINATIONS_MODELS)} Pollinations[/bold] → "
-                f"[bold]Openverse[/bold] → gradient"
+                f"[bold]Openverse[/bold] → gradient  |  9:16 ({IMAGE_W}×{IMAGE_H})"
             )
         else:
             self._log(
                 f"[yellow]No HF token — chain: "
-                f"{len(POLLINATIONS_MODELS)} Pollinations → Openverse (CC photos) → gradient[/yellow]"
+                f"{len(POLLINATIONS_MODELS)} Pollinations → Openverse → gradient[/yellow]"
+                f"  |  9:16 ({IMAGE_W}×{IMAGE_H})"
             )
 
         images_generated = 0
@@ -66,26 +72,25 @@ class ImageAgent(BaseAgent):
             self._log(f"Generating image(s) for: [cyan]{topic}[/cyan]")
 
             if "image_prompts" in post and isinstance(post["image_prompts"], list):
-                paths = []
-                for idx, raw_prompt in enumerate(post["image_prompts"][:3]):
-                    prompt   = self._enhance_prompt(raw_prompt)
-                    filename = f"post_{post['rank']}_{int(time.time())}_{idx}.png"
-                    path     = self._generate(prompt, filename,
-                                              search_query=topic, slide_index=idx)
-                    if path:
-                        paths.append(str(path))
-                        images_generated += 1
-                    else:
-                        self._log(f"  [red]Slide {idx + 1}: all backends failed[/red]")
-                    if idx < 2:
-                        time.sleep(4)
-                post["image_paths"]  = paths
-                post["image_path"]   = paths[0] if paths else None
-                post["image_status"] = "generated" if paths else "failed"
+                raw_prompts = post["image_prompts"][:3]
+                paths = self._generate_slides_parallel(raw_prompts, post["rank"], topic)
+                post["image_paths"]  = [p for p in paths if p]
+                post["image_path"]   = post["image_paths"][0] if post["image_paths"] else None
+                post["image_status"] = "generated" if post["image_paths"] else "failed"
+                images_generated    += len(post["image_paths"])
+                if not post["image_paths"]:
+                    self._log(f"  [red]All slides failed for: {topic}[/red]")
             else:
-                prompt   = self._enhance_prompt(post.get("image_prompt", topic))
-                filename = f"post_{post['rank']}_{int(time.time())}.png"
-                path     = self._generate(prompt, filename, search_query=topic)
+                raw      = post.get("image_prompt", topic)
+                prompt   = self._rewrite_prompt(raw, topic)
+                enhanced = self._enhance_prompt(prompt)
+                cached   = self._cache_path(enhanced)
+                if cached.exists():
+                    self._log(f"  Cache hit → {cached.name}")
+                    path = cached
+                else:
+                    filename = f"post_{post['rank']}_{int(time.time() * 1000)}.png"
+                    path = self._generate(enhanced, filename, search_query=topic)
                 if path:
                     post["image_path"]   = str(path)
                     post["image_paths"]  = [str(path)]
@@ -96,8 +101,6 @@ class ImageAgent(BaseAgent):
                     post["image_paths"]  = []
                     post["image_status"] = "failed"
                     self._log(f"  [red]All backends failed for: {topic}[/red]")
-                if len(posts) > 1:
-                    time.sleep(4)
 
         self._log(f"[green]{images_generated} image(s) generated across {len(posts)} post(s)[/green]")
         return self._success(
@@ -105,6 +108,57 @@ class ImageAgent(BaseAgent):
             reasoning=f"{images_generated} images via HF + Pollinations + Openverse chain"
         )
 
+    def _generate_slides_parallel(self, raw_prompts: list[str], rank: int, topic: str) -> list[str | None]:
+        results: list[str | None] = [None] * len(raw_prompts)
+
+        def _do(idx: int, raw: str) -> tuple[int, str | None]:
+            prompt   = self._rewrite_prompt(raw, topic)
+            enhanced = self._enhance_prompt(prompt)
+            cached   = self._cache_path(enhanced)
+            if cached.exists():
+                self._log(f"  Slide {idx + 1}: cache hit → {cached.name}")
+                return idx, str(cached)
+            filename = f"post_{rank}_{int(time.time() * 1000)}_{idx}.png"
+            path = self._generate(enhanced, filename, search_query=topic, slide_index=idx)
+            if not path:
+                self._log(f"  [red]Slide {idx + 1}: all backends failed[/red]")
+            return idx, str(path) if path else None
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = {pool.submit(_do, i, r): i for i, r in enumerate(raw_prompts)}
+            for fut in as_completed(futures):
+                try:
+                    idx, path = fut.result()
+                    results[idx] = path
+                except Exception as e:
+                    self._log(f"  [red]Slide error: {e}[/red]")
+
+        return results
+
+    def _cache_path(self, prompt: str) -> Path:
+        key = hashlib.md5(prompt.encode()).hexdigest()[:12]
+        return IMAGES_DIR / f"cache_{key}.png"
+
+    def _rewrite_prompt(self, raw_prompt: str, topic: str) -> str:
+        llm_prompt = f"""You are an image prompt engineer for Instagram Reels (9:16 vertical).
+Rewrite the image idea below into a vivid, specific scene for an AI image generator.
+
+Topic: {topic}
+Raw idea: {raw_prompt}
+
+Rules:
+- Describe ONE concrete visual scene: setting, lighting, key objects, mood, color palette
+- No faces, no real people, no text or logos
+- Optimized for vertical 9:16 portrait framing
+- 1-2 sentences, pure visual description only
+
+Respond with ONLY the rewritten prompt, nothing else."""
+        try:
+            result = self.think(llm_prompt).strip()
+            result = re.sub(r'^["\']|["\']$', '', result).strip()
+            return result if result else raw_prompt
+        except Exception:
+            return raw_prompt
 
     _BLOCKED_TERMS = [
         "President", "Prime Minister", "Governor", "Senator", "Secretary of State",
@@ -123,9 +177,8 @@ class ImageAgent(BaseAgent):
             f"{safe}, "
             "no real people, no faces, symbolic imagery, "
             "professional photography, vibrant colors, high resolution, "
-            "1:1 aspect ratio, sharp focus, cinematic lighting, modern aesthetic"
+            "9:16 vertical portrait, sharp focus, cinematic lighting, modern aesthetic"
         )
-
 
     def _generate(self, prompt: str, filename: str,
                   model_index: int = 0, _rate_retries: int = 0,
@@ -139,7 +192,7 @@ class ImageAgent(BaseAgent):
         try:
             client = InferenceClient(token=self.hf_token)
             self._log(f"  HF [{model_index + 1}/{len(HF_MODELS)}]: {model.split('/')[-1]}")
-            image = client.text_to_image(prompt, model=model)
+            image = client.text_to_image(prompt, model=model, width=IMAGE_W, height=IMAGE_H)
             image_path = IMAGES_DIR / filename
             image.save(str(image_path))
             self._log(f"  [green]HF OK → {filename}[/green]")
@@ -176,7 +229,6 @@ class ImageAgent(BaseAgent):
                 self._log("  Error — next HF model...")
                 return self._generate(prompt, filename, model_index + 1, 0, search_query, slide_index)
 
-
     def _generate_pollinations(self, prompt: str, filename: str,
                                 model_index: int = 0,
                                 search_query: str = None,
@@ -193,7 +245,7 @@ class ImageAgent(BaseAgent):
             encoded = urllib.parse.quote(prompt[:480])
             url = (
                 f"https://image.pollinations.ai/prompt/{encoded}"
-                f"?width=768&height=768&model={model}&seed={int(time.time())}"
+                f"?width={IMAGE_W}&height={IMAGE_H}&model={model}&seed={int(time.time())}"
             )
             r = requests.get(url, timeout=90, stream=True)
 
@@ -234,7 +286,6 @@ class ImageAgent(BaseAgent):
             return self._generate_pollinations(prompt, filename, model_index + 1,
                                                search_query, slide_index)
 
-    
     def _generate_openverse(self, filename: str, search_query: str = None,
                             slide_index: int = 0) -> Path | None:
         try:
