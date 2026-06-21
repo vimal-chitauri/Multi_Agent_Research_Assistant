@@ -1,0 +1,24 @@
+# ─── LLM ────────────────────────────────────────────────────
+groq==1.4.0                  # Groq API client
+huggingface_hub              # HF Inference API client (image generation)
+moviepy==1.0.3               # Video creation (Ken Burns effect, audio mixing)
+
+# ─── Environment ────────────────────────────────────────────
+python-dotenv==1.0.1         # Load .env file into os.environ
+
+# ─── Trend Sources ──────────────────────────────────────────
+pytrends==4.9.2              # Google Trends (unofficial, free)
+praw==7.7.1                  # Reddit API wrapper
+newsapi-python==0.2.7        # NewsAPI.org client
+requests==2.32.3             # HTTP requests
+
+# ─── Async ──────────────────────────────────────────────────
+aiohttp==3.9.5               # Async HTTP (for parallel agent calls)
+
+# ─── Publishing ─────────────────────────────────────────────
+tweepy==4.14.0               # Twitter API v2
+python-telegram-bot==21.3    # Telegram bot (approval notifications)
+
+# ─── Utilities ──────────────────────────────────────────────
+pydantic==2.7.4              # Data validation / structured outputs
+rich==13.7.1                 # Beautiful terminal output for debugging

@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.DS_Store
+venv/
+.venv/
+generated_images/
+generated_videos/
+generated_voices/
+rag_db/
+social/
