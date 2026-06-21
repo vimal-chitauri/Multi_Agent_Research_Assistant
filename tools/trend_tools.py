@@ -377,9 +377,9 @@ def get_twitter_trending(niche: str) -> list[dict]:
         import tweepy
         client = tweepy.Client(bearer_token=bearer_token, wait_on_rate_limit=False)
         response = client.search_recent_tweets(
-            query       = f"{query} -is:retweet",
-            max_results = 100,
-            tweet_fields= ["public_metrics", "entities"],
+            query        = f"{query} -is:retweet",
+            max_results  = 100,
+            tweet_fields = ["public_metrics", "entities"],
         )
         if not response.data:
             return []
@@ -399,10 +399,8 @@ def get_twitter_trending(niche: str) -> list[dict]:
                 tag = (ht.get("tag") or "").lower()
                 if tag and len(tag) > 2:
                     hashtag_scores[tag] = hashtag_scores.get(tag, 0) + engagement
-
-            text = tweet.text
             if engagement > 50:
-                tk = _topic_key(text)
+                tk = _topic_key(tweet.text)
                 if tk:
                     topic_scores[tk] = topic_scores.get(tk, 0) + engagement
 
@@ -411,7 +409,6 @@ def get_twitter_trending(niche: str) -> list[dict]:
         for tag, score in sorted(hashtag_scores.items(), key=lambda x: -x[1])[:10]:
             results.append({"topic": f"#{tag}", "score": min(100, int(score // 20)), "source": "twitter"})
             seen.add(tag)
-
         for topic, score in sorted(topic_scores.items(), key=lambda x: -x[1])[:5]:
             if topic not in seen:
                 results.append({"topic": topic, "score": min(100, int(score // 20)), "source": "twitter"})
@@ -420,8 +417,17 @@ def get_twitter_trending(niche: str) -> list[dict]:
         print(f"  [Twitter] {len(results)} trending topics fetched")
         return results
 
+    except tweepy.errors.Forbidden:
+        print("  [Twitter] Free tier does not support read access — skipping (Basic plan $100/mo required)")
+        return []
+    except tweepy.errors.TooManyRequests:
+        print("  [Twitter] Rate limited — skipping")
+        return []
     except Exception as e:
-        print(f"  [Twitter] Failed: {e}")
+        if "402" in str(e) or "Payment" in str(e) or "credits" in str(e).lower():
+            print("  [Twitter] No API credits — skipping (Basic plan required for reads)")
+        else:
+            print(f"  [Twitter] Failed: {e}")
         return []
 
 
