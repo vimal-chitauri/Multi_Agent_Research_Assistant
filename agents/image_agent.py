@@ -18,14 +18,26 @@ IMAGES_DIR.mkdir(exist_ok=True)
 IMAGE_W = 1080
 IMAGE_H = 1920
 
+# How many visual variants to generate per slide (different seeds → more choice)
+NUM_VARIANTS = 2
+
 HF_MODELS = [
-    "black-forest-labs/FLUX.1-schnell",           # fast, good quality
+    "black-forest-labs/FLUX.1-schnell",           # fastest free, great quality
     "stabilityai/stable-diffusion-3.5-medium",    # best anatomy on free tier
     "stabilityai/stable-diffusion-xl-base-1.0",
     "stabilityai/stable-diffusion-2-1",
     "runwayml/stable-diffusion-v1-5",
     "dreamlike-art/dreamlike-photoreal-2.0",
     "prompthero/openjourney",
+]
+
+POLLINATIONS_MODELS = [
+    "flux-realism",   # most relevant / photorealistic — first choice
+    "flux",
+    "flux-anime",
+    "flux-3d",
+    "turbo",
+    "dreamshaper",
 ]
 
 # Anatomy-focused negative prompt — suppresses distorted hands/faces even when
@@ -39,15 +51,6 @@ NEGATIVE_PROMPT = (
     "duplicate, morbid, gross proportions, cloned face, out of frame, "
     "low quality, low resolution, text, logo, signature, username"
 )
-
-POLLINATIONS_MODELS = [
-    "flux",
-    "flux-realism",
-    "flux-anime",
-    "flux-3d",
-    "turbo",
-    "dreamshaper",
-]
 
 
 class ImageAgent(BaseAgent):
@@ -69,30 +72,43 @@ class ImageAgent(BaseAgent):
             self._log(
                 f"Image chain: [bold]{len(HF_MODELS)} HF[/bold] → "
                 f"[bold]{len(POLLINATIONS_MODELS)} Pollinations[/bold] → "
-                f"[bold]Openverse[/bold] → gradient  |  9:16 ({IMAGE_W}×{IMAGE_H})"
+                f"[bold]Openverse[/bold] → gradient  |  "
+                f"9:16 ({IMAGE_W}×{IMAGE_H})  |  {NUM_VARIANTS} variants/slide"
             )
         else:
             self._log(
-                f"[yellow]No HF token — chain: "
-                f"{len(POLLINATIONS_MODELS)} Pollinations → Openverse → gradient[/yellow]"
-                f"  |  9:16 ({IMAGE_W}×{IMAGE_H})"
+                f"[yellow]No HF token[/yellow] — chain: Pollinations → Openverse → gradient  |  "
+                f"9:16 ({IMAGE_W}×{IMAGE_H})  |  {NUM_VARIANTS} variants/slide"
             )
 
         images_generated = 0
 
         for post in posts:
             topic = post["topic"]
-            self._log(f"Generating image(s) for: [cyan]{topic}[/cyan]")
+            self._log(f"Generating images for: [cyan]{topic}[/cyan]")
 
             if "image_prompts" in post and isinstance(post["image_prompts"], list):
                 raw_prompts = post["image_prompts"][:3]
-                paths = self._generate_slides_parallel(raw_prompts, post["rank"], topic)
-                post["image_paths"]  = [p for p in paths if p]
-                post["image_path"]   = post["image_paths"][0] if post["image_paths"] else None
-                post["image_status"] = "generated" if post["image_paths"] else "failed"
-                images_generated    += len(post["image_paths"])
+                all_variants = self._generate_slides_parallel(raw_prompts, post["rank"], topic)
+
+                # Primary path per slide (first variant) — used by video agent
+                primary_paths = [v[0] if v else None for v in all_variants]
+                # All flat paths across slides/variants — for UI display
+                all_paths = [p for variants in all_variants for p in variants]
+
+                post["image_paths"]    = [p for p in primary_paths if p]
+                post["image_variants"] = all_variants
+                post["image_path"]     = post["image_paths"][0] if post["image_paths"] else None
+                post["image_status"]   = "generated" if post["image_paths"] else "failed"
+                images_generated      += len(all_paths)
                 if not post["image_paths"]:
                     self._log(f"  [red]All slides failed for: {topic}[/red]")
+                else:
+                    self._log(
+                        f"  [green]{len(all_paths)} image(s) across "
+                        f"{len(post['image_paths'])} slide(s) "
+                        f"({NUM_VARIANTS} variants each)[/green]"
+                    )
             else:
                 raw      = post.get("image_prompt", topic)
                 prompt   = self._rewrite_prompt(raw, topic)
@@ -105,52 +121,67 @@ class ImageAgent(BaseAgent):
                     filename = f"post_{post['rank']}_{int(time.time() * 1000)}.png"
                     path = self._generate(enhanced, filename, search_query=topic)
                 if path:
-                    post["image_path"]   = str(path)
-                    post["image_paths"]  = [str(path)]
-                    post["image_status"] = "generated"
-                    images_generated    += 1
+                    post["image_path"]     = str(path)
+                    post["image_paths"]    = [str(path)]
+                    post["image_variants"] = [[str(path)]]
+                    post["image_status"]   = "generated"
+                    images_generated      += 1
                 else:
-                    post["image_path"]   = None
-                    post["image_paths"]  = []
-                    post["image_status"] = "failed"
+                    post["image_path"]     = None
+                    post["image_paths"]    = []
+                    post["image_variants"] = []
+                    post["image_status"]   = "failed"
                     self._log(f"  [red]All backends failed for: {topic}[/red]")
 
-        self._log(f"[green]{images_generated} image(s) generated across {len(posts)} post(s)[/green]")
+        self._log(f"[green]{images_generated} total image(s) across {len(posts)} post(s)[/green]")
         return self._success(
             data={"posts": posts, "total": len(posts), "images_generated": images_generated},
-            reasoning=f"{images_generated} images via HF + Pollinations + Openverse chain"
+            reasoning=f"{images_generated} images via HF + Pollinations chain ({NUM_VARIANTS} variants/slide)"
         )
 
-    def _generate_slides_parallel(self, raw_prompts: list[str], rank: int, topic: str) -> list[str | None]:
-        results: list[str | None] = [None] * len(raw_prompts)
+    def _generate_slides_parallel(
+        self, raw_prompts: list[str], rank: int, topic: str
+    ) -> list[list[str]]:
+        """Generate NUM_VARIANTS per slide, all slides in parallel. Returns list[list[path]]."""
+        # results[slide_idx] = list of successful paths
+        results: list[list[str]] = [[] for _ in raw_prompts]
 
-        def _do(idx: int, raw: str) -> tuple[int, str | None]:
+        def _do(slide_idx: int, variant_idx: int, raw: str) -> tuple[int, str | None]:
             prompt   = self._rewrite_prompt(raw, topic)
             enhanced = self._enhance_prompt(prompt)
-            cached   = self._cache_path(enhanced)
+            cache_key = f"{enhanced}|v{variant_idx}"
+            cached    = self._cache_path(cache_key)
             if cached.exists():
-                self._log(f"  Slide {idx + 1}: cache hit → {cached.name}")
-                return idx, str(cached)
-            filename = f"post_{rank}_{int(time.time() * 1000)}_{idx}.png"
-            path = self._generate(enhanced, filename, search_query=topic, slide_index=idx)
+                self._log(f"  Slide {slide_idx + 1} v{variant_idx + 1}: cache hit → {cached.name}")
+                return slide_idx, str(cached)
+            # Each variant uses a distinct seed so images look different
+            seed     = variant_idx * 31337
+            ts       = int(time.time() * 1000) + variant_idx
+            filename = f"post_{rank}_{ts}_{slide_idx}_v{variant_idx}.png"
+            path = self._generate(
+                enhanced, filename,
+                search_query=topic, slide_index=slide_idx, seed=seed,
+            )
             if not path:
-                self._log(f"  [red]Slide {idx + 1}: all backends failed[/red]")
-            return idx, str(path) if path else None
+                self._log(f"  [red]Slide {slide_idx + 1} v{variant_idx + 1}: all backends failed[/red]")
+            return slide_idx, str(path) if path else None
 
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = {pool.submit(_do, i, r): i for i, r in enumerate(raw_prompts)}
+        tasks = [(i, v) for i in range(len(raw_prompts)) for v in range(NUM_VARIANTS)]
+        with ThreadPoolExecutor(max_workers=min(len(tasks), 6)) as pool:
+            futures = {pool.submit(_do, i, v, raw_prompts[i]): (i, v) for i, v in tasks}
             for fut in as_completed(futures):
                 try:
-                    idx, path = fut.result()
-                    results[idx] = path
+                    slide_idx, path = fut.result()
+                    if path:
+                        results[slide_idx].append(path)
                 except Exception as e:
                     self._log(f"  [red]Slide error: {e}[/red]")
 
         return results
 
-    def _cache_path(self, prompt: str) -> Path:
-        key = hashlib.md5(prompt.encode()).hexdigest()[:12]
-        return IMAGES_DIR / f"cache_{key}.png"
+    def _cache_path(self, key: str) -> Path:
+        h = hashlib.md5(key.encode()).hexdigest()[:12]
+        return IMAGES_DIR / f"cache_{h}.png"
 
     def _rewrite_prompt(self, raw_prompt: str, topic: str) -> str:
         llm_prompt = f"""You are an image prompt engineer for Instagram Reels (9:16 vertical).
@@ -161,8 +192,8 @@ Raw idea: {raw_prompt}
 
 Rules:
 - Describe ONE concrete visual scene: setting, lighting, key objects, mood, color palette
-- AVOID all human figures, faces, hands, or body parts — use objects, landscapes, or
-  abstract/symbolic imagery instead (e.g. glowing tech, cityscapes, nature, icons)
+- AVOID all human figures, faces, hands, body parts — use objects, landscapes, or
+  symbolic/abstract imagery instead (glowing tech, cityscapes, nature, icons, data visuals)
 - No text, logos, watermarks in the scene
 - Optimized for vertical 9:16 portrait framing
 - 1-2 sentences, pure visual description only
@@ -190,18 +221,20 @@ Respond with ONLY the rewritten prompt, nothing else."""
                           safe, flags=re.IGNORECASE)
         return (
             f"{safe}, "
-            "no real people, no faces, symbolic imagery, "
+            "no real people, no faces, no hands, symbolic imagery, "
             "professional photography, vibrant colors, high resolution, "
             "9:16 vertical portrait, sharp focus, cinematic lighting, modern aesthetic"
         )
 
     def _generate(self, prompt: str, filename: str,
                   model_index: int = 0, _rate_retries: int = 0,
-                  search_query: str = None, slide_index: int = 0) -> Path | None:
+                  search_query: str = None, slide_index: int = 0,
+                  seed: int = 0) -> Path | None:
         if not self.hf_token or model_index >= len(HF_MODELS):
-            return self._generate_pollinations(prompt, filename, 0,
-                                               search_query=search_query,
-                                               slide_index=slide_index)
+            return self._generate_pollinations(
+                prompt, filename, 0,
+                search_query=search_query, slide_index=slide_index, seed=seed,
+            )
 
         model = HF_MODELS[model_index]
         try:
@@ -213,6 +246,7 @@ Respond with ONLY the rewritten prompt, nothing else."""
                 width=IMAGE_W,
                 height=IMAGE_H,
                 negative_prompt=NEGATIVE_PROMPT,
+                seed=seed or None,
             )
             image_path = IMAGES_DIR / filename
             image.save(str(image_path))
@@ -226,36 +260,43 @@ Respond with ONLY the rewritten prompt, nothing else."""
             if "503" in err or "loading" in err.lower():
                 self._log("  Model loading — waiting 25s...")
                 time.sleep(25)
-                return self._generate(prompt, filename, model_index, _rate_retries, search_query, slide_index)
+                return self._generate(prompt, filename, model_index, _rate_retries,
+                                      search_query, slide_index, seed)
 
             elif "429" in err or "rate" in err.lower() or "too many" in err.lower():
                 if _rate_retries < 3:
                     wait = 30 * (_rate_retries + 1)
                     self._log(f"  Rate limited — backing off {wait}s ({_rate_retries + 1}/3)...")
                     time.sleep(wait)
-                    return self._generate(prompt, filename, model_index, _rate_retries + 1, search_query, slide_index)
+                    return self._generate(prompt, filename, model_index, _rate_retries + 1,
+                                          search_query, slide_index, seed)
                 self._log("  Rate limit exhausted — next HF model...")
-                return self._generate(prompt, filename, model_index + 1, 0, search_query, slide_index)
+                return self._generate(prompt, filename, model_index + 1, 0,
+                                      search_query, slide_index, seed)
 
             elif "402" in err or "payment" in err.lower():
                 self._log("  Pro plan required — next HF model...")
-                return self._generate(prompt, filename, model_index + 1, 0, search_query, slide_index)
+                return self._generate(prompt, filename, model_index + 1, 0,
+                                      search_query, slide_index, seed)
 
             elif ("nsfw" in err.lower() or "safety" in err.lower()
                   or "inappropriate" in err.lower() or "400" in err):
                 self._log("  Safety filter — next HF model...")
-                return self._generate(prompt, filename, model_index + 1, 0, search_query, slide_index)
+                return self._generate(prompt, filename, model_index + 1, 0,
+                                      search_query, slide_index, seed)
 
             else:
                 self._log("  Error — next HF model...")
-                return self._generate(prompt, filename, model_index + 1, 0, search_query, slide_index)
+                return self._generate(prompt, filename, model_index + 1, 0,
+                                      search_query, slide_index, seed)
 
     def _generate_pollinations(self, prompt: str, filename: str,
                                 model_index: int = 0,
                                 search_query: str = None,
-                                slide_index: int = 0) -> Path | None:
+                                slide_index: int = 0,
+                                seed: int = 0) -> Path | None:
         if model_index >= len(POLLINATIONS_MODELS):
-            self._log("  Pollinations all rate-limited — trying Openverse...")
+            self._log("  Pollinations exhausted — trying Openverse...")
             return self._generate_openverse(filename, search_query=search_query,
                                             slide_index=slide_index)
 
@@ -265,22 +306,22 @@ Respond with ONLY the rewritten prompt, nothing else."""
         try:
             encoded          = urllib.parse.quote(prompt[:480])
             encoded_negative = urllib.parse.quote(NEGATIVE_PROMPT[:300])
+            seed_val         = (seed or int(time.time())) + model_index
             url = (
                 f"https://image.pollinations.ai/prompt/{encoded}"
                 f"?width={IMAGE_W}&height={IMAGE_H}&model={model}"
-                f"&negative={encoded_negative}&seed={int(time.time())}"
+                f"&negative={encoded_negative}&seed={seed_val}&enhance=true&nologo=true"
             )
             r = requests.get(url, timeout=90, stream=True)
 
             if r.status_code == 402:
                 self._log(f"  Rate-limited ({model}) — next variant...")
                 return self._generate_pollinations(prompt, filename, model_index + 1,
-                                                   search_query, slide_index)
-
+                                                   search_query, slide_index, seed)
             if r.status_code != 200:
                 self._log(f"  HTTP {r.status_code} — next variant...")
                 return self._generate_pollinations(prompt, filename, model_index + 1,
-                                                   search_query, slide_index)
+                                                   search_query, slide_index, seed)
 
             image_path = IMAGES_DIR / filename
             with open(image_path, "wb") as f:
@@ -295,7 +336,7 @@ Respond with ONLY the rewritten prompt, nothing else."""
                 self._log("  Not a valid image — next variant...")
                 image_path.unlink(missing_ok=True)
                 return self._generate_pollinations(prompt, filename, model_index + 1,
-                                                   search_query, slide_index)
+                                                   search_query, slide_index, seed)
 
             self._log(f"  [green]Pollinations OK ({model}) → {filename}[/green]")
             return image_path
@@ -303,11 +344,11 @@ Respond with ONLY the rewritten prompt, nothing else."""
         except requests.exceptions.Timeout:
             self._log(f"  Timeout ({model}) — next variant...")
             return self._generate_pollinations(prompt, filename, model_index + 1,
-                                               search_query, slide_index)
+                                               search_query, slide_index, seed)
         except Exception as e:
             self._log(f"  {model} error: {str(e)[:80]} — next variant...")
             return self._generate_pollinations(prompt, filename, model_index + 1,
-                                               search_query, slide_index)
+                                               search_query, slide_index, seed)
 
     def _generate_openverse(self, filename: str, search_query: str = None,
                             slide_index: int = 0) -> Path | None:
