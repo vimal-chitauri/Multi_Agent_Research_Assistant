@@ -15,6 +15,9 @@ MUSIC_DIR  = Path(__file__).parent.parent / "generated_videos" / "music_cache"
 VIDEOS_DIR.mkdir(exist_ok=True)
 MUSIC_DIR.mkdir(exist_ok=True)
 
+VID_W = 1080
+VID_H = 1920
+
 ANIMATION_EFFECTS = ["slide_up", "fade", "slide_left", "typewriter"]
 
 _HOOK_TEXTS = {
@@ -136,33 +139,20 @@ def download_music(track: dict, filename: str) -> str | None:
     return None
 
 
-def generate_ai_video(prompt: str, hf_token: str, output_path: str) -> str | None:
-    try:
-        from huggingface_hub import InferenceClient
-        client = InferenceClient(token=hf_token)
-        print("  LTX-Video on HuggingFace (~60-120s)...")
-        video_bytes = client.text_to_video(prompt, model="Lightricks/LTX-Video")
-        with open(output_path, "wb") as f:
-            f.write(video_bytes.read() if hasattr(video_bytes, "read") else video_bytes)
-        print(f"  AI video ready ({os.path.getsize(output_path)//1024} KB)")
-        return output_path
-    except Exception as e:
-        print(f"  AI video failed: {e}")
-        return None
+
+def _create_shot_from_image(img_arr: np.ndarray, shot_idx: int) -> np.ndarray:
+    h, w         = img_arr.shape[:2]
+    cx, cy, zoom = SHOT_DEFS[shot_idx % len(SHOT_DEFS)]
+    cw = int(w / zoom)
+    ch = int(h / zoom)
+    x1 = max(0, min(int(cx * w - cw // 2), w - cw))
+    y1 = max(0, min(int(cy * h - ch // 2), h - ch))
+    crop = img_arr[y1:y1+ch, x1:x1+cw]
+    return np.array(Image.fromarray(crop).resize((VID_W, VID_H), Image.LANCZOS))
 
 
 def _create_shots(img_arr: np.ndarray, n: int) -> list[np.ndarray]:
-    h, w  = img_arr.shape[:2]
-    shots = []
-    for i in range(n):
-        cx, cy, zoom = SHOT_DEFS[i % len(SHOT_DEFS)]
-        cw = int(w / zoom)
-        ch = int(h / zoom)
-        x1 = max(0, min(int(cx * w - cw // 2), w - cw))
-        y1 = max(0, min(int(cy * h - ch // 2), h - ch))
-        crop = img_arr[y1:y1 + ch, x1:x1 + cw]
-        shots.append(np.array(Image.fromarray(crop).resize((1080, 1080), Image.LANCZOS)))
-    return shots
+    return [_create_shot_from_image(img_arr, i) for i in range(n)]
 
 
 def _zoom_frame(arr: np.ndarray, zoom: float) -> np.ndarray:
@@ -229,7 +219,7 @@ def weighted_segment_durations(groups: list, total_duration: float, min_secs: fl
 
 
 def _render_hook_card(frame_bg: np.ndarray, text: str, t: float) -> np.ndarray:
-    H, W = 1080, 1080
+    H, W = frame_bg.shape[:2]
     img = Image.fromarray(frame_bg)
     img = img.resize((W // 18, H // 18), Image.BILINEAR).resize((W, H), Image.NEAREST).convert("RGBA")
     dark = Image.new("RGBA", (W, H), (0, 0, 0, 210))
@@ -311,7 +301,7 @@ def _generate_base_frames(
 
 def _get_gradient_base(niche: str) -> tuple[np.ndarray, int, tuple]:
     if niche not in _GRADIENT_CACHE:
-        W, H        = 1080, 1080
+        W, H        = VID_W, VID_H
         overlay_top = int(H * 0.60)
         accent      = _niche_accent_color(niche)
 
@@ -340,12 +330,13 @@ def _render_segment_overlay(
     n_groups: int,
     effect: str,
     trans_secs: float = 0.6,
+    watermark: str = "",
 ) -> np.ndarray:
     gradient_arr, overlay_top, accent = _get_gradient_base(niche)
 
     img  = Image.fromarray(gradient_arr.copy())
     draw = ImageDraw.Draw(img)
-    W, H = 1080, 1080
+    W, H = VID_W, VID_H
     pad  = 52
 
     ENTER_DUR = 0.15
@@ -422,8 +413,9 @@ def _render_segment_overlay(
     d_w  = len(dots) * 13
     draw.text((W - d_w - pad, H - 36), dots, fill=(*accent, d_a), font=f_small)
 
-    b_a = int(140 * min(seg_t / 0.5, 1.0))
-    draw.text((pad, H - 36), "AI Marketing Agent", fill=(150, 150, 150, b_a), font=f_small)
+    if watermark:
+        b_a = int(140 * min(seg_t / 0.5, 1.0))
+        draw.text((pad, H - 36), watermark, fill=(150, 150, 150, b_a), font=f_small)
 
     return np.array(img)
 
@@ -435,7 +427,7 @@ def _composite_rgba_over_rgb(frame: np.ndarray, overlay: np.ndarray) -> np.ndarr
 
 
 def create_video(
-    image_path: str,
+    image_paths: list[str],
     title: str,
     info_lines: list[str],
     music_path: str | None,
@@ -444,59 +436,34 @@ def create_video(
     fps: int = 24,
     niche: str = "technology",
     voice_path: str | None = None,
-    hf_token: str | None = None,
-    video_prompt: str | None = None,
     rank: int = 0,
     hook: str | None = None,
+    watermark: str = "",
 ) -> str:
     from moviepy.editor import ImageSequenceClip, AudioFileClip, concatenate_audioclips
 
     groups = group_bullet_points(info_lines)
     n      = len(groups)
     total  = duration * fps
-    print(f"  {n} segments | {len(info_lines)} bullet points → grouped")
+    valid  = [p for p in (image_paths or []) if p and os.path.exists(p)]
+    print(f"  {n} segments | {len(info_lines)} bullets | {len(valid)} image(s) → Ken Burns 9:16")
 
     seg_durations = weighted_segment_durations(groups, float(duration))
 
-    ai_video_path = None
-    if hf_token and video_prompt:
-        tmp           = str(VIDEOS_DIR / f"ai_raw_{int(time.time())}.mp4")
-        ai_video_path = generate_ai_video(video_prompt, hf_token, tmp)
+    # Build one Ken Burns shot per segment, cycling through all available images
+    shots = []
+    for i in range(n):
+        if valid:
+            img_arr = np.array(
+                Image.open(valid[i % len(valid)]).convert("RGB")
+                .resize((VID_W + 120, VID_H + 200), Image.LANCZOS)
+            )
+        else:
+            img_arr = np.zeros((VID_H + 200, VID_W + 120, 3), dtype=np.uint8)
+        shots.append(_create_shot_from_image(img_arr, i))
 
-    if ai_video_path and os.path.exists(ai_video_path):
-        print("  AI video: extracting frames as shots...")
-        from moviepy.editor import VideoFileClip, concatenate_videoclips
-
-        base_clip = VideoFileClip(ai_video_path)
-        if base_clip.duration < duration:
-            loops     = math.ceil(duration / base_clip.duration)
-            base_clip = concatenate_videoclips([base_clip] * loops)
-        base_clip = base_clip.subclip(0, duration)
-
-        seg_len = total // n
-        shots   = []
-        for si in range(n):
-            mid_t     = (si * seg_len + seg_len // 2) / fps
-            raw_frame = base_clip.get_frame(min(mid_t, base_clip.duration - 0.1))
-            h, w      = raw_frame.shape[:2]
-            s         = min(h, w)
-            sq        = raw_frame[(h-s)//2:(h-s)//2+s, (w-s)//2:(w-s)//2+s]
-            shots.append(np.array(Image.fromarray(sq).resize((1080, 1080), Image.LANCZOS)))
-
-        base_frames = _generate_base_frames(shots, duration, fps)
-        render_fps  = min(fps, int(base_clip.fps or fps))
-
-        try:
-            base_clip.close()
-            os.remove(ai_video_path)
-        except Exception:
-            pass
-    else:
-        print("  Image: creating cinematic multi-shot sequence...")
-        img_large   = np.array(Image.open(image_path).convert("RGB").resize((1300, 1300), Image.LANCZOS))
-        shots       = _create_shots(img_large, n)
-        base_frames = _generate_base_frames(shots, duration, fps)
-        render_fps  = fps
+    base_frames = _generate_base_frames(shots, duration, fps)
+    render_fps  = fps
 
     TRANS_SECS   = 0.6
     FLASH_FRAMES = max(2, int(fps * 0.083))
@@ -544,6 +511,7 @@ def create_video(
                 n_groups   = n,
                 effect     = effect,
                 trans_secs = TRANS_SECS,
+                watermark  = watermark,
             )
             composited = _composite_rgba_over_rgb(frame, overlay)
 
@@ -591,7 +559,7 @@ def create_video(
         fps=render_fps,
         codec="libx264",
         audio_codec="aac",
-        temp_audiofile=str(VIDEOS_DIR / "temp_audio.m4a"),
+        temp_audiofile=str(Path(output_path).parent / f"_tmp_{Path(output_path).stem}.m4a"),
         remove_temp=True,
         logger=None,
     )
@@ -604,8 +572,9 @@ def create_image_with_text(
     info_lines: list[str],
     output_path: str,
     niche: str = "",
+    watermark: str = "",
 ) -> str:
-    img     = Image.open(image_path).convert("RGBA").resize((1080, 1080), Image.LANCZOS)
+    img     = Image.open(image_path).convert("RGBA").resize((VID_W, VID_H), Image.LANCZOS)
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw    = ImageDraw.Draw(overlay)
     overlay_top = int(img.size[1] * 0.60)
@@ -630,8 +599,9 @@ def create_image_with_text(
         y += 56
         if y > comp.size[1] - 60:
             break
-    draw_rgb.text((comp.size[0] - 320, comp.size[1] - 38), "AI Marketing Agent",
-                  fill=(150, 150, 150), font=f_small)
+    if watermark:
+        draw_rgb.text((comp.size[0] - 320, comp.size[1] - 38), watermark,
+                      fill=(150, 150, 150), font=f_small)
     comp.save(output_path, "JPEG", quality=95)
     return output_path
 
@@ -760,7 +730,7 @@ def _draw_rich(draw, text: str, x: int, y: int, font, default_color: tuple, kws:
 
 
 def _render_heading_frame(img_arr: np.ndarray, heading: str, source_name: str, rank: int) -> np.ndarray:
-    H, W  = 1080, 1080
+    H, W  = VID_H, VID_W
     style = rank % 4
     WARM  = (255, 250, 235, 255)
     GOLD  = (255, 200, 50,  255)
@@ -831,7 +801,7 @@ def _render_bullets_frame(
     n_visible: int,
     anim_t:    float = 1.0,
 ) -> np.ndarray:
-    H, W   = 1080, 1080
+    H, W   = VID_H, VID_W
     style  = rank % 4
     LINE_H = 64
     font_b = _load_bold_font(54)
@@ -960,7 +930,7 @@ def create_news_video(
     from moviepy.editor import ImageSequenceClip, AudioFileClip, concatenate_audioclips
 
     FLASH_FRAMES = max(2, int(fps * 0.083))
-    W, H         = 1080, 1080
+    W, H         = VID_W, VID_H
     n            = len(bullets)
     split        = max(1, n // 2)
     bullets_a    = bullets[:split]
@@ -1164,7 +1134,7 @@ def create_news_video(
         fps=fps,
         codec="libx264",
         audio_codec="aac",
-        temp_audiofile=str(VIDEOS_DIR / "temp_audio.m4a"),
+        temp_audiofile=str(Path(output_path).parent / f"_tmp_{Path(output_path).stem}.m4a"),
         remove_temp=True,
         logger=None,
     )

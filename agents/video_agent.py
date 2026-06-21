@@ -1,15 +1,11 @@
 import os
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from dotenv import load_dotenv
 from agents.base_agent import BaseAgent, AgentResult
-from tools.video_tools import (
-    NICHE_VIDEO_PROMPTS,
-    create_video,
-    create_news_video,
-    group_bullet_points,
-)
+from tools.video_tools import create_video, create_news_video
 
 load_dotenv(override=True)
 
@@ -79,7 +75,6 @@ class VideoAgent(BaseAgent):
         super().__init__(name="VideoAgent", model="smart")
         self.duration = duration
         self.niche    = niche
-        self.hf_token = os.getenv("HUGGINGFACE_TOKEN")
 
     @property
     def system_prompt(self) -> str:
@@ -92,48 +87,41 @@ class VideoAgent(BaseAgent):
 
         niche = input_data.get("niche", self.niche)
 
-        if not self.hf_token:
-            self._log("[yellow]HUGGINGFACE_TOKEN not set — AI video disabled, using Ken Burns[/yellow]")
-
         self._log(
-            f"Creating [bold]{self.duration}s[/bold] videos | niche: [cyan]{niche}[/cyan] | "
-            f"AI video: [cyan]{'on' if self.hf_token else 'off (Ken Burns fallback)'}[/cyan]"
+            f"Creating [bold]{self.duration}s[/bold] 9:16 videos | "
+            f"niche: [cyan]{niche}[/cyan] | "
+            f"posts: {len(posts)} | parallel: up to 3"
         )
 
         videos_created = 0
+        results: list[dict] = []
 
-        for post in posts:
-            topic      = post["topic"]
-            image_path = post.get("image_path")
-            rank       = post.get("rank", 0)
-            timestamp  = int(time.time())
+        def _render(post: dict) -> dict:
+            topic     = post["topic"]
+            rank      = post.get("rank", 0)
+            timestamp = int(time.time() * 1000) + rank
+            video_path = str(VIDEOS_DIR / f"post_{rank}_{timestamp}.mp4")
 
             music_path  = post.get("music_path")
             music_title = post.get("music_title", "No music")
-
             self._log(
-                f"Processing: [cyan]{topic}[/cyan]  |  "
-                f"music: [dim]{'✓ ' + music_title[:40] if music_path else 'none'}[/dim]"
+                f"  Rendering: [cyan]{topic[:45]}[/cyan]  |  "
+                f"music: {'✓' if music_path else '–'}"
             )
-
-            video_path = str(VIDEOS_DIR / f"post_{rank}_{timestamp}.mp4")
 
             try:
                 if niche.lower() == "latest_news":
-                    image_paths = post.get("image_paths", [])
-                    if image_path and not image_paths:
-                        image_paths = [image_path]
+                    image_paths = post.get("image_paths") or (
+                        [post["image_path"]] if post.get("image_path") else []
+                    )
                     if not image_paths:
-                        self._log("  [yellow]No AI images — using gradient fallback slides[/yellow]")
+                        self._log("  [yellow]No images — gradient fallback slides[/yellow]")
 
-                    heading = post.get("heading", topic)
-                    bullets = post.get("bullets", [])
-                    if not bullets:
-                        bullets = self._generate_info_content(topic, niche)
+                    bullets = post.get("bullets") or self._generate_info_content(topic, niche)
 
                     create_news_video(
                         image_paths  = image_paths,
-                        heading      = heading,
+                        heading      = post.get("heading", topic),
                         bullets      = bullets,
                         source_name  = post.get("source_name", ""),
                         music_path   = music_path,
@@ -143,68 +131,76 @@ class VideoAgent(BaseAgent):
                         voice_timing = post.get("voice_timing"),
                         hook         = self._generate_hook(topic, niche),
                     )
-                    post.update({
-                        "video_path":   video_path,
-                        "video_status": "created",
-                        "music_title":  music_title,
-                    })
-
                 else:
-                    if not image_path or not os.path.exists(image_path):
-                        self._log("  [yellow]No image — skipping[/yellow]")
-                        post.update({"video_path": None, "video_status": "skipped — no image", "music_title": None})
-                        continue
+                    # Use all available image variants for visual variety
+                    image_paths = post.get("image_paths") or (
+                        [post["image_path"]] if post.get("image_path") else []
+                    )
+                    if not image_paths:
+                        self._log(f"  [yellow]No image for rank {rank} — skipping[/yellow]")
+                        post.update({"video_path": None, "video_status": "skipped — no image"})
+                        return post
 
-                    info_lines   = self._generate_info_content(topic, niche)
-                    video_prompt = self._build_video_prompt(topic, niche)
-                    groups       = group_bullet_points(info_lines)
+                    info_lines = self._generate_info_content(topic, niche)
 
                     create_video(
-                        image_path   = image_path,
-                        title        = topic,
-                        info_lines   = info_lines,
-                        music_path   = music_path,
-                        output_path  = video_path,
-                        duration     = self.duration,
-                        niche        = niche,
-                        voice_path   = post.get("voice_path"),
-                        hf_token     = self.hf_token,
-                        video_prompt = video_prompt,
-                        rank         = rank,
-                        hook         = self._generate_hook(topic, niche),
+                        image_paths = image_paths,
+                        title       = topic,
+                        info_lines  = info_lines,
+                        music_path  = music_path,
+                        output_path = video_path,
+                        duration    = self.duration,
+                        niche       = niche,
+                        voice_path  = post.get("voice_path"),
+                        rank        = rank,
+                        hook        = self._generate_hook(topic, niche),
+                        watermark   = niche.replace("_", " ").title(),
                     )
-                    post.update({
-                        "video_path":    video_path,
-                        "video_status":  "created",
-                        "music_title":   music_title,
-                        "info_content":  info_lines,
-                        "n_segments":    len(groups),
-                    })
+                    post["info_content"] = info_lines
 
-                videos_created += 1
-                self._log(f"  [green]Done: {Path(video_path).name}[/green]")
+                post.update({
+                    "video_path":   video_path,
+                    "video_status": "created",
+                    "music_title":  music_title,
+                })
+                self._log(f"  [green]✓ {Path(video_path).name}[/green]")
 
             except Exception as e:
-                self._log(f"  [red]Render failed: {e}[/red]")
-                post.update({"video_path": None, "video_status": f"failed — {str(e)[:80]}", "music_title": None})
+                self._log(f"  [red]Render failed ({topic[:30]}): {e}[/red]")
+                post.update({"video_path": None, "video_status": f"failed — {str(e)[:80]}"})
+
+            return post
+
+        with ThreadPoolExecutor(max_workers=min(len(posts), 3)) as pool:
+            futures = {pool.submit(_render, post): post for post in posts}
+            for fut in as_completed(futures):
+                try:
+                    result = fut.result()
+                    results.append(result)
+                    if result.get("video_status") == "created":
+                        videos_created += 1
+                except Exception as e:
+                    orig = futures[fut]
+                    orig.update({"video_path": None, "video_status": f"failed — {str(e)[:80]}"})
+                    results.append(orig)
+
+        # Restore original ordering by rank
+        results.sort(key=lambda p: p.get("rank", 0))
 
         self._log(f"[green]{videos_created}/{len(posts)} videos created[/green]")
         return self._success(
             data={
-                "posts":         posts,
-                "total":         len(posts),
+                "posts":          results,
+                "total":          len(posts),
                 "videos_created": videos_created,
-                "duration_sec":  self.duration,
+                "duration_sec":   self.duration,
             },
-            reasoning=f"{videos_created}/{len(posts)} x {self.duration}s videos | niche: {niche} | "
-                      f"AI video: {'LTX-Video' if self.hf_token else 'Ken Burns fallback'} | "
-                      f"music: {'Freesound' if self.freesound else 'silent'}",
+            reasoning=f"{videos_created}/{len(posts)} × {self.duration}s 9:16 videos | Ken Burns | niche: {niche}",
         )
 
     def _generate_info_content(self, topic: str, niche: str) -> list[str]:
         prompt_template = NICHE_CONTENT_PROMPTS.get(niche.lower(), DEFAULT_PROMPT)
         prompt = prompt_template.format(topic=topic, niche=niche)
-
         try:
             response = self.think(prompt)
             cleaned  = response.strip()
@@ -217,7 +213,6 @@ class VideoAgent(BaseAgent):
                 return [str(l) for l in lines[:10]]
         except Exception as e:
             self._log(f"  [yellow]LLM content gen failed ({e}) — using defaults[/yellow]")
-
         return _fallback_content(niche)
 
     def _generate_hook(self, topic: str, niche: str) -> str | None:
@@ -228,19 +223,12 @@ class VideoAgent(BaseAgent):
             f"No colons, no quotes, no hashtags. Respond with ONLY the hook text."
         )
         try:
-            hook = self.think(prompt).strip().strip('"').strip("'")
+            hook  = self.think(prompt).strip().strip('"').strip("'")
             words = hook.split()[:12]
             mid   = len(words) // 2
             return " ".join(words[:mid]) + "\n" + " ".join(words[mid:])
         except Exception:
             return None
-
-    def _build_video_prompt(self, topic: str, niche: str) -> str:
-        template = NICHE_VIDEO_PROMPTS.get(
-            niche.lower(),
-            "Professional cinematic scene about {topic}, 4K high quality, smooth motion",
-        )
-        return template.format(topic=topic)
 
 
 def _fallback_content(niche: str) -> list[str]:
