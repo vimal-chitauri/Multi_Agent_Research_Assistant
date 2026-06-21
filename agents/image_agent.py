@@ -19,13 +19,26 @@ IMAGE_W = 1080
 IMAGE_H = 1920
 
 HF_MODELS = [
-    "black-forest-labs/FLUX.1-schnell",
+    "black-forest-labs/FLUX.1-schnell",           # fast, good quality
+    "stabilityai/stable-diffusion-3.5-medium",    # best anatomy on free tier
     "stabilityai/stable-diffusion-xl-base-1.0",
     "stabilityai/stable-diffusion-2-1",
     "runwayml/stable-diffusion-v1-5",
     "dreamlike-art/dreamlike-photoreal-2.0",
     "prompthero/openjourney",
 ]
+
+# Anatomy-focused negative prompt — suppresses distorted hands/faces even when
+# they slip through the "no people" instruction in the positive prompt.
+NEGATIVE_PROMPT = (
+    "deformed, bad anatomy, disfigured, poorly drawn face, mutation, mutated, "
+    "extra limb, ugly, poorly drawn hands, missing limb, floating limbs, "
+    "disconnected limbs, malformed hands, blurry, mutated hands and fingers, "
+    "watermark, oversaturated, distorted hands, amputation, missing hands, "
+    "extra fingers, fused fingers, too many fingers, long neck, bad proportions, "
+    "duplicate, morbid, gross proportions, cloned face, out of frame, "
+    "low quality, low resolution, text, logo, signature, username"
+)
 
 POLLINATIONS_MODELS = [
     "flux",
@@ -148,7 +161,9 @@ Raw idea: {raw_prompt}
 
 Rules:
 - Describe ONE concrete visual scene: setting, lighting, key objects, mood, color palette
-- No faces, no real people, no text or logos
+- AVOID all human figures, faces, hands, or body parts — use objects, landscapes, or
+  abstract/symbolic imagery instead (e.g. glowing tech, cityscapes, nature, icons)
+- No text, logos, watermarks in the scene
 - Optimized for vertical 9:16 portrait framing
 - 1-2 sentences, pure visual description only
 
@@ -192,7 +207,13 @@ Respond with ONLY the rewritten prompt, nothing else."""
         try:
             client = InferenceClient(token=self.hf_token)
             self._log(f"  HF [{model_index + 1}/{len(HF_MODELS)}]: {model.split('/')[-1]}")
-            image = client.text_to_image(prompt, model=model, width=IMAGE_W, height=IMAGE_H)
+            image = client.text_to_image(
+                prompt,
+                model=model,
+                width=IMAGE_W,
+                height=IMAGE_H,
+                negative_prompt=NEGATIVE_PROMPT,
+            )
             image_path = IMAGES_DIR / filename
             image.save(str(image_path))
             self._log(f"  [green]HF OK → {filename}[/green]")
@@ -242,10 +263,12 @@ Respond with ONLY the rewritten prompt, nothing else."""
         self._log(f"  Pollinations [{model_index + 1}/{len(POLLINATIONS_MODELS)}]: {model}")
 
         try:
-            encoded = urllib.parse.quote(prompt[:480])
+            encoded          = urllib.parse.quote(prompt[:480])
+            encoded_negative = urllib.parse.quote(NEGATIVE_PROMPT[:300])
             url = (
                 f"https://image.pollinations.ai/prompt/{encoded}"
-                f"?width={IMAGE_W}&height={IMAGE_H}&model={model}&seed={int(time.time())}"
+                f"?width={IMAGE_W}&height={IMAGE_H}&model={model}"
+                f"&negative={encoded_negative}&seed={int(time.time())}"
             )
             r = requests.get(url, timeout=90, stream=True)
 
