@@ -11,6 +11,7 @@ pytrends==4.9.2              # Google Trends (unofficial, free)
 praw==7.7.1                  # Reddit API wrapper
 newsapi-python==0.2.7        # NewsAPI.org client
 requests==2.32.3             # HTTP requests
+feedparser==6.0.11           # RSS / Atom feed parser
 
 # ─── Async ──────────────────────────────────────────────────
 aiohttp==3.9.5               # Async HTTP (for parallel agent calls)
