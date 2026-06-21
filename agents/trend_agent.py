@@ -38,24 +38,33 @@ class TrendAgent(BaseAgent):
         if niche.lower() == "latest_news":
             return self._run_latest_news(exclude_topics=exclude, count=count)
 
-        self._log("Fetching signals in parallel: Google Trends · Reddit · NewsAPI …")
+        self._log("Fetching signals in parallel: Google · YouTube · Reddit · NewsAPI · RSS …")
         signals = fetch_all_signals(niche, parallel=True)
 
-        news = [a for a in signals.get("news", []) if "error" not in a]
+        news    = [a for a in signals.get("news",    []) if "error" not in a]
+        youtube = signals.get("youtube", [])
+        rss     = signals.get("rss",     [])
+        twitter = signals.get("twitter", [])
         self._log(
             f"  Fetched in {signals.get('fetch_ms', '?')}ms  |  "
             f"Google daily={len(signals.get('google_daily', []))}  "
             f"rising={len(signals.get('google_rising', []))}  "
             f"Reddit={len(signals.get('reddit', []))}  "
-            f"News={len(news)}"
+            f"News={len(news)}  "
+            f"YouTube={len(youtube)}  "
+            f"RSS={len(rss)}  "
+            f"Twitter={len(twitter)}"
         )
 
         scored = score_topics(
-            google_daily  = signals.get("google_daily",  []),
-            google_rising = signals.get("google_rising", []),
-            reddit_posts  = signals.get("reddit",        []),
-            news_articles = signals.get("news",          []),
-            hackernews    = signals.get("hackernews",    []),
+            google_daily   = signals.get("google_daily",  []),
+            google_rising  = signals.get("google_rising", []),
+            reddit_posts   = signals.get("reddit",        []),
+            news_articles  = signals.get("news",          []),
+            hackernews     = signals.get("hackernews",    []),
+            youtube_videos = youtube,
+            twitter_topics = twitter,
+            rss_articles   = rss,
         )
 
         if not scored:
@@ -63,9 +72,9 @@ class TrendAgent(BaseAgent):
             hn = signals.get("hackernews", [])
             scored = [
                 {
-                    "topic":    s["title"],
-                    "score":    min(100.0, s["score"] / 5),
-                    "sources":  ["hackernews"],
+                    "topic":     s["title"],
+                    "score":     min(100.0, s["score"] / 5),
+                    "sources":   ["hackernews"],
                     "n_sources": 1,
                 }
                 for s in hn[:10]
@@ -98,7 +107,9 @@ class TrendAgent(BaseAgent):
 
         prompt = f"""
 You are a social media content strategist for {niche}. Below are the top trending topics
-today, already scored and ranked by our signal system (Google Trends 40% + Reddit 35% + News 25%).
+today, already scored and ranked by our signal system:
+Google 30% + YouTube 20% + Reddit 20% + News 15% + Twitter 10% + RSS 5%
+Topics appearing across multiple sources get a cross-source boost (+12 pts each).
 
 YOUR JOB: Pick the best {count} topics from this list for short-form video content.
 
@@ -106,6 +117,7 @@ PREFER topics that:
   ✓ Are broad enough for a global audience
   ✓ Have a clear educational, inspiring, or curiosity angle
   ✓ A compelling 8-bullet script can be written about them
+  ✓ Confirmed by multiple sources (google + youtube + rss = very strong signal)
   ✓ NOT just the score — a #5 topic with a great video angle beats a boring #1
 {exclusion_block}
 
@@ -124,7 +136,7 @@ Respond ONLY with this JSON (no other text):
       "post_type": "informative | entertaining | news | tips | educational",
       "target_audience": "who this appeals to",
       "content_angle": "the specific angle that makes this a great video",
-      "sources": ["google", "reddit", "news"]
+      "sources": ["google", "youtube", "rss"]
     }}
   ],
   "reasoning": "why these {count} topics were chosen over the others"
@@ -148,7 +160,7 @@ Respond ONLY with this JSON (no other text):
                 "total_candidates": len(scored),
                 "fetch_ms":         signals.get("fetch_ms", 0),
                 "sources_active":   [
-                    s for s in ["google", "reddit", "news", "hackernews"]
+                    s for s in ["google", "youtube", "reddit", "news", "hackernews", "rss", "twitter"]
                     if any(s in t.get("sources", []) for t in scored[:10])
                 ],
             }
